@@ -1,0 +1,42 @@
+[package]
+name = "file-kafka-loader-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Kafka file producer"
+
+[dependencies]
+envconfig = "0.10.0"
+eyre = "0.6.6"
+notify = "4.0.17"
+serde_yaml = "0.8.23"
+prometheus-static-metric = "0.5.1"
+lazy_static = "1.4.0"
+log = "0.4.14"
+fern = "0.6.0"
+regex = "1.5.4"
+serde_json = "1.0.78"
+erased-serde = "0.3.18"
+dyn-clone = "1.0.4"
+num_cpus = "1.13.1"
+multiqueue = "0.3.2"
+prometheus_exporter = "0.8.4"
+ansi_term = "0.12.1"
+clap = { version = "3.0.13", features = ["cargo"] }
+rusqlite = { version = "0.26.3", features = ["bundled", "serde_json"] }
+chrono = { version = "0.4.19", features = ["serde"] }
+url = { version = "2.2.2", features = ["serde"] }
+prometheus = { version = "0.13.0", features = ["process"] }
+rdkafka = { version = "0.28.0", features = [
+    "gssapi-vendored",
+    "ssl-vendored",
+    "zstd",
+    "libz-static",
+    "external-lz4",
+] }
+serde = { version = "1.0.135", features = ["derive"] }
+schema_registry_converter = { version = "2.1.0", features = [
+    "avro",
+    "blocking",
+    "url",
+] }
+schemars = { version = "0.8.8", features = ["preserve_order"] }

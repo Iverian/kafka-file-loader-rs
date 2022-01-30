@@ -1,0 +1,10 @@
+---
+output:
+  topic: test
+input:
+  dir: .
+  pattern: ".*"
+  schema:
+    fields:
+      - name: c
+        type: hui
