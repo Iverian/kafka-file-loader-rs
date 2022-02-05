@@ -1,44 +1,63 @@
-use std::{
-    io::stdout, path::Path, path::PathBuf, sync::mpsc::Receiver, sync::mpsc::Sender,
-    sync::mpsc::TrySendError, thread, time::Duration,
-};
+use std::mem;
+use std::time::Duration;
+use std::{io::stdout, path::Path, path::PathBuf};
 
 use chrono::Local;
 use chrono::{DateTime, Utc};
-use eyre::bail;
-use eyre::eyre;
-use eyre::Result;
 use fern::Dispatch;
+use futures::future;
 use log::LevelFilter;
-use multiqueue::{MPMCReceiver, MPMCSender};
 use rdkafka::message::OwnedHeaders;
+use schema_registry_converter::async_impl::avro::AvroEncoder;
+use schema_registry_converter::schema_registry_common::SubjectNameStrategy;
 use serde::{Deserialize, Serialize};
+use stable_eyre::eyre::Context;
+use stable_eyre::eyre::Result;
+use stable_eyre::eyre::{bail, eyre};
+use stable_eyre::Report;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::task::JoinError;
 
+use crate::constants::{
+    BASE_SEND_TIMEOUT, BROADCAST_CAPACITY, MAX_SEND_TIMEOUT, SEND_TIMEOUT_MULTIPLIER,
+};
+use crate::csv::record_reader::Record;
+use crate::csv::util::ReadItem;
 use crate::metrics::QUEUE_SIZE;
 
-const SEND_RETRIES: usize = 10;
-const SEND_TIMEOUT: Duration = Duration::from_millis(500);
-
-pub type ResultSender = Sender<Result<()>>;
-pub type ResultReceiver = Receiver<Result<()>>;
 pub type RejectItem = Box<RawStreamMessage>;
-pub type RejectSender = Sender<RejectItem>;
-pub type RejectReceiver = Receiver<RejectItem>;
-
-pub struct ThreadWaiter {
-    tx: ResultSender,
-    rx: ResultReceiver,
-    counter: usize,
-}
+pub type RejectSender = AsyncChannelSender<RejectItem>;
+pub type RejectReceiver = AsyncChannelReceiver<RejectItem>;
+pub type TaskJoinHandle = tokio::task::JoinHandle<Result<()>>;
+pub type CancelSender = tokio::sync::broadcast::Sender<()>;
+pub type CancelReceiver = tokio::sync::broadcast::Receiver<()>;
 
 #[derive(Clone)]
 pub struct QueueSender {
-    pub inner: MPMCSender<FileMessage>,
+    inner: flume::Sender<FileMessage>,
 }
 
 #[derive(Clone)]
 pub struct QueueReceiver {
-    pub inner: MPMCReceiver<FileMessage>,
+    pub inner: flume::Receiver<FileMessage>,
+}
+
+#[derive(Clone)]
+pub struct ChannelSender<T> {
+    pub inner: std::sync::mpsc::Sender<T>,
+}
+
+pub struct ChannelReceiver<T> {
+    pub inner: std::sync::mpsc::Receiver<T>,
+}
+
+#[derive(Clone)]
+pub struct AsyncChannelSender<T> {
+    pub inner: tokio::sync::mpsc::Sender<T>,
+}
+
+pub struct AsyncChannelReceiver<T> {
+    pub inner: tokio::sync::mpsc::Receiver<T>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,64 +79,181 @@ pub struct RawStreamMessage {
     pub payload: RawMessage,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawMessage {
     pub raw: String,
     pub headers: Headers,
 }
 
-impl ThreadWaiter {
+#[derive(Debug)]
+pub struct TaskHandle {
+    inner: Vec<TaskJoinHandle>,
+    tx: CancelSender,
+}
+
+pub struct CancelToken {
+    rx: CancelReceiver,
+}
+
+impl CancelToken {
+    pub async fn recv(&mut self) -> Result<()> {
+        self.rx
+            .recv()
+            .await
+            .map_err(|err| eyre!("error receiving cancellation: {}", err))
+    }
+}
+
+impl TaskHandle {
     pub fn new() -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
-        Self { tx, rx, counter: 0 }
+        let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            inner: Vec::new(),
+            tx,
+        }
     }
 
-    pub fn wait_for(&self) -> Result<()> {
-        for _ in 0..self.counter {
-            self.rx.recv()??;
+    pub fn cancel_token(&self) -> CancelToken {
+        CancelToken {
+            rx: self.tx.subscribe(),
+        }
+    }
+
+    pub fn push(&mut self, task: TaskJoinHandle) {
+        self.inner.push(task);
+    }
+
+    pub async fn join(mut self) -> Result<()> {
+        let cancel_fut = tokio::spawn(async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(_) => Err(eyre!("ctrl+c")),
+                Err(err) => Err(Report::new(err)),
+            }
+        });
+        self.inner.push(cancel_fut);
+
+        let mut futures = mem::replace(&mut self.inner, Vec::new());
+        log::info!("waiting for {} tasks", futures.len());
+        loop {
+            if let Some(futs) = self.complete(future::select_all(futures).await).await? {
+                log::info!("{} tasks left", futs.len());
+                futures = futs;
+            } else {
+                break;
+            }
         }
         Ok(())
     }
-    pub fn spawn<F: 'static + Send + FnOnce() -> Result<()>>(&mut self, callable: F) {
-        let tx = self.tx.clone();
-        self.counter += 1;
-        std::thread::spawn(move || {
-            tx.send(callable()).unwrap();
-        });
+
+    async fn complete(
+        &self,
+        select_all: (Result<Result<()>, JoinError>, usize, Vec<TaskJoinHandle>),
+    ) -> Result<Option<Vec<TaskJoinHandle>>> {
+        let (result, _, futures) = select_all;
+        match result {
+            Ok(res) => {
+                if let Err(err) = res {
+                    log::warn!(": {}", err);
+                    self.tx.send(())?;
+                    TaskHandle::cancel(futures).await;
+                    return Ok(None);
+                }
+            }
+            Err(err) => {
+                log::warn!("error joining task: {}", err);
+                return Ok(Some(futures));
+            }
+        }
+        Ok(if futures.is_empty() {
+            None
+        } else {
+            Some(futures)
+        })
+    }
+
+    async fn cancel(futures: Vec<TaskJoinHandle>) {
+        log::info!("cancelling tasks");
+        for fut in futures.into_iter() {
+            TaskHandle::log_task_error(fut.await);
+        }
+    }
+
+    fn log_task_error(task_result: Result<Result<()>, JoinError>) {
+        if let Ok(res) = task_result {
+            if let Err(err) = res {
+                log::warn!("task failed: {}", err);
+            }
+        }
+    }
+}
+
+impl<T> ChannelReceiver<T> {
+    pub fn try_recv(&self) -> Result<T, std::sync::mpsc::TryRecvError> {
+        self.inner.try_recv()
+    }
+}
+
+impl<T> AsyncChannelSender<T> {
+    pub async fn send_async(&self, mut message: T) -> Result<()> {
+        let mut timeout = BASE_SEND_TIMEOUT;
+        loop {
+            if let Err(err) = self.inner.try_send(message) {
+                match err {
+                    TrySendError::Full(msg) => {
+                        timeout = wait_for_retry_async(timeout).await;
+                        message = msg;
+                    }
+                    TrySendError::Closed(_) => {
+                        bail!("channel disconnected");
+                    }
+                }
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn send(&self, mut message: T) -> Result<()> {
+        let mut timeout = BASE_SEND_TIMEOUT;
+        loop {
+            if let Err(err) = self.inner.try_send(message) {
+                match err {
+                    TrySendError::Full(msg) => {
+                        timeout = wait_for_retry(timeout);
+                        message = msg;
+                    }
+                    TrySendError::Closed(_) => {
+                        bail!("channel disconnected");
+                    }
+                }
+            } else {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl<T> AsyncChannelReceiver<T> {
+    pub async fn recv(&mut self) -> Result<T> {
+        self.inner
+            .recv()
+            .await
+            .ok_or_else(|| eyre!("channel closed"))
     }
 }
 
 impl QueueReceiver {
-    pub fn recv(&self) -> Result<FileMessage> {
-        let msg = self.inner.recv()?;
+    pub async fn recv(&self) -> Result<FileMessage> {
+        let msg = self.inner.recv_async().await?;
         QUEUE_SIZE.dec();
         Ok(msg)
     }
 }
 
 impl QueueSender {
-    pub fn try_send(&self, mut msg: FileMessage) -> Result<()> {
-        let mut retries = 0;
-        loop {
-            if let Err(err) = self.inner.try_send(msg) {
-                match err {
-                    TrySendError::Full(inner) => {
-                        if retries == SEND_RETRIES {
-                            bail!("error sending message: queue is full");
-                        }
-                        retries += 1;
-                        msg = inner;
-                        thread::sleep(SEND_TIMEOUT);
-                    }
-                    TrySendError::Disconnected(_) => {
-                        bail!("error sending message: disconnected");
-                    }
-                }
-            } else {
-                QUEUE_SIZE.inc();
-                break;
-            }
-        }
+    pub async fn send(&self, msg: FileMessage) -> Result<()> {
+        self.inner.send_async(msg).await?;
+        QUEUE_SIZE.inc();
         Ok(())
     }
 }
@@ -161,8 +297,23 @@ impl Headers {
     }
 }
 
-pub fn create_queue(capacity: u64) -> (QueueSender, QueueReceiver) {
-    let (tx, rx) = multiqueue::mpmc_queue(capacity);
+pub fn create_sync_channel<T>() -> (ChannelSender<T>, ChannelReceiver<T>) {
+    let (tx, rx) = std::sync::mpsc::channel::<T>();
+    (ChannelSender { inner: tx }, ChannelReceiver { inner: rx })
+}
+
+pub fn create_async_channel<T>(
+    capacity: usize,
+) -> (AsyncChannelSender<T>, AsyncChannelReceiver<T>) {
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+    (
+        AsyncChannelSender { inner: tx },
+        AsyncChannelReceiver { inner: rx },
+    )
+}
+
+pub fn create_queue(capacity: usize) -> (QueueSender, QueueReceiver) {
+    let (tx, rx) = flume::bounded(capacity);
     (QueueSender { inner: tx }, QueueReceiver { inner: rx })
 }
 
@@ -183,19 +334,29 @@ pub fn configure_logging(log_level: LevelFilter) -> Result<()> {
     Ok(())
 }
 
-pub fn try_send<T>(sender: &Sender<T>, mut msg: T) -> Result<()> {
-    let mut retries = 0;
-    loop {
-        if let Err(err) = sender.send(msg) {
-            if retries == SEND_RETRIES {
-                bail!("error sending message");
-            }
-            retries += 1;
-            msg = err.0;
-            thread::sleep(SEND_TIMEOUT);
-        } else {
-            break;
-        }
+pub async fn encode_read_item(
+    avro_encoder: &AvroEncoder<'_>,
+    item: ReadItem<Record<'_>>,
+    sr_strategy: SubjectNameStrategy,
+) -> ReadItem<Vec<u8>> {
+    ReadItem {
+        raw: item.raw,
+        result: match item.result {
+            Ok(value) => avro_encoder
+                .encode(value, sr_strategy)
+                .await
+                .wrap_err("unable to encode message to avro"),
+            Err(err) => Err(err),
+        },
     }
-    Ok(())
+}
+
+pub fn wait_for_retry(timeout: Duration) -> Duration {
+    std::thread::sleep(timeout);
+    std::cmp::min(MAX_SEND_TIMEOUT, timeout * SEND_TIMEOUT_MULTIPLIER)
+}
+
+pub async fn wait_for_retry_async(timeout: Duration) -> Duration {
+    tokio::time::sleep(timeout).await;
+    std::cmp::min(MAX_SEND_TIMEOUT, timeout * SEND_TIMEOUT_MULTIPLIER)
 }

@@ -1,13 +1,17 @@
-use std::collections::HashMap;
-use std::io::Read;
 use std::iter::Iterator;
+use std::task::Poll;
 
-use eyre::ensure;
-use eyre::eyre;
-use eyre::Result;
+use futures::Stream;
+use pin_project_lite::pin_project;
 use serde_json::json;
 use serde_json::Value;
+use stable_eyre::eyre::ensure;
+use stable_eyre::eyre::eyre;
+use stable_eyre::eyre::Context;
+use stable_eyre::eyre::Result;
+use tokio::io::AsyncRead;
 
+use super::engine::ExprEngine;
 use super::field::Field;
 use super::field_type::CsvFieldItem;
 use super::reader::ReadIterator;
@@ -22,17 +26,22 @@ pub struct RecordReader {
     null_string: String,
 }
 
-pub struct RecordReadIterator<'a, R: Read> {
-    parent: &'a RecordReader,
+pin_project! {
+pub struct RecordReadIterator<'a, R: AsyncRead> {
+    #[pin]
     lines: ReadIterator<'a, R>,
+    parent: &'a RecordReader,
+}
 }
 
-pub type Record = HashMap<String, CsvFieldItem>;
+pub type Record<'a> = Vec<(&'a str, CsvFieldItem)>;
 
 impl RecordReader {
-    pub fn new(model: &StreamSchemaModel) -> Result<Self> {
+    pub fn new(model: StreamSchemaModel) -> Result<Self> {
+        let expr_engine = ExprEngine::new();
+        let fields = RecordReader::fields(&expr_engine, model.fields)?;
         Ok(Self {
-            fields: RecordReader::fields(&model.fields)?,
+            fields,
             reader: Reader::new(
                 model.format.header,
                 model.format.delimiter,
@@ -42,40 +51,44 @@ impl RecordReader {
         })
     }
 
-    pub fn read<R: Read>(&self, read: R) -> RecordReadIterator<R> {
+    pub fn read<R: AsyncRead>(&self, read: R) -> RecordReadIterator<R> {
         RecordReadIterator {
             parent: &self,
             lines: self.reader.read(read),
         }
     }
 
-    pub fn read_parsed(&self, line: Vec<String>) -> Result<Record> {
-        let mut result = HashMap::new();
+    pub fn read_parsed(&self, mut line: Vec<String>) -> Result<Record> {
         ensure!(line.len() <= self.fields.len(), "too many records");
+        let mut result = Vec::new();
+        line.reverse();
 
-        for (idx, field) in self.fields.iter().enumerate() {
-            let is_null = idx < line.len() && line[idx] != self.null_string;
+        for field in self.fields.iter() {
+            let mut is_null = true;
+            let value = match line.pop() {
+                Some(value) => {
+                    is_null = value != self.null_string;
+                    Some(value)
+                }
+                None => None,
+            };
             ensure!(
                 !field.optional() && !is_null,
                 format!("required field '{}' is missing", field.name())
             );
 
-            result.insert(
-                field.name().to_owned(),
+            result.push((
+                field.name(),
                 field
-                    .cast(if is_null {
-                        Some(line[idx].as_str())
-                    } else {
-                        None
-                    })
+                    .cast(value)
                     .map_err(|err| eyre!("error parsing field '{}': {}", field.name(), err))?,
-            );
+            ));
         }
         Ok(result)
     }
 
     pub fn read_owned(&self, line: String) -> ReadItem<Record> {
-        match self.reader.read_line(line.as_bytes()) {
+        match self.reader.read_line(&line) {
             Ok(rec) => ReadItem {
                 raw: Some(line),
                 result: self.read_parsed(rec),
@@ -87,14 +100,10 @@ impl RecordReader {
         }
     }
 
-    pub fn schema_name(&self, topic: &str) -> String {
-        format!("{}-value", topic)
-    }
-
-    pub fn schema_str(&self, topic: &str) -> String {
+    pub fn schema_str(&self, name: &str) -> String {
         json!({
             "type": "record",
-            "name": self.schema_name(topic),
+            "name": name,
             "fields": self.fields
                 .iter()
                 .map(|x| x.schema())
@@ -103,10 +112,10 @@ impl RecordReader {
         .to_string()
     }
 
-    pub fn schema(&self, topic: &str) -> Value {
+    pub fn schema(&self, name: &str) -> Value {
         json!({
             "type": "record",
-            "name": self.schema_name(topic),
+            "name": name,
             "fields": self.fields
                 .iter()
                 .map(|x| x.schema())
@@ -114,33 +123,55 @@ impl RecordReader {
         })
     }
 
-    fn fields(model: &Vec<StreamFieldModel>) -> Result<Vec<Field>> {
+    fn fields(engine: &ExprEngine, model: Vec<StreamFieldModel>) -> Result<Vec<Field>> {
         let mut result = Vec::with_capacity(model.len());
         for field in model {
-            result.push(Field::new(
-                &field.name,
-                field.optional,
-                &field.data_type,
-                field.format.as_ref().map(|x| x.as_str()),
-            )?);
+            let field_name = field.name.clone();
+            result.push(
+                RecordReader::try_create_field(engine, field)
+                    .wrap_err(format!("error creating field {:?} from model", &field_name))?,
+            );
         }
         Ok(result)
     }
+
+    fn try_create_field(engine: &ExprEngine, field: StreamFieldModel) -> Result<Field> {
+        Ok(Field::new(
+            field.name,
+            field.optional,
+            field.data_type,
+            field.format,
+            match field.expr {
+                Some(expr) => Some(engine.compile(expr)?),
+                None => None,
+            },
+        )?)
+    }
 }
 
-impl<'a, R: Read> Iterator for RecordReadIterator<'a, R> {
-    type Item = ReadItem<Record>;
+impl<'a, R: AsyncRead> Stream for RecordReadIterator<'a, R> {
+    type Item = ReadItem<Record<'a>>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.lines.next().map(|item| match item.result {
-            Ok(parsed) => ReadItem {
-                raw: item.raw,
-                result: self.parent.read_parsed(parsed),
-            },
-            Err(err) => ReadItem {
-                raw: item.raw,
-                result: Err(err),
-            },
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        this.lines.poll_next(cx).map(|opt| {
+            opt.map(|item| match item.result {
+                Ok(value) => ReadItem {
+                    raw: item.raw,
+                    result: this.parent.read_parsed(value),
+                },
+                Err(err) => ReadItem {
+                    raw: item.raw,
+                    result: Err(err),
+                },
+            })
         })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.lines.size_hint()
     }
 }

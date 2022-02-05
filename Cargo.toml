@@ -6,7 +6,6 @@ description = "Kafka file producer"
 
 [dependencies]
 envconfig = "0.10.0"
-eyre = "0.6.6"
 notify = "4.0.17"
 serde_yaml = "0.8.23"
 prometheus-static-metric = "0.5.1"
@@ -15,14 +14,23 @@ log = "0.4.14"
 fern = "0.6.0"
 regex = "1.5.4"
 serde_json = "1.0.78"
-erased-serde = "0.3.18"
 dyn-clone = "1.0.4"
 num_cpus = "1.13.1"
-multiqueue = "0.3.2"
-prometheus_exporter = "0.8.4"
 ansi_term = "0.12.1"
+avro-rs = "0.13.0"
+warp = "0.3.2"
+pin-project-lite = "0.2.8"
+futures = "0.3.19"
+stable-eyre = "0.2.2"
+tokio = { version = "1.16.1", features = [
+    "rt-multi-thread",
+    "fs",
+    "macros",
+    "signal",
+    "time",
+    "tracing",
+] }
 clap = { version = "3.0.13", features = ["cargo"] }
-rusqlite = { version = "0.26.3", features = ["bundled", "serde_json"] }
 chrono = { version = "0.4.19", features = ["serde"] }
 url = { version = "2.2.2", features = ["serde"] }
 prometheus = { version = "0.13.0", features = ["process"] }
@@ -34,9 +42,12 @@ rdkafka = { version = "0.28.0", features = [
     "external-lz4",
 ] }
 serde = { version = "1.0.135", features = ["derive"] }
-schema_registry_converter = { version = "2.1.0", features = [
+schema_registry_converter = { git = "https://github.com/gklijs/schema_registry_converter", branch = "master", features = [
     "avro",
-    "blocking",
     "url",
 ] }
 schemars = { version = "0.8.8", features = ["preserve_order"] }
+flume = { version = "0.10.10", features = ["async"] }
+tokio-stream = { version = "0.1.8", features = ["io-util"] }
+rhai = { version = "1.4.1", features = ["sync", "no_module"] }
+console-subscriber = { version = "0.1.1", features = ["parking_lot"] }

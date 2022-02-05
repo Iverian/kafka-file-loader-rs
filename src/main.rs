@@ -1,4 +1,5 @@
 mod config;
+mod constants;
 mod csv;
 mod fswatch;
 mod metrics;
@@ -13,27 +14,26 @@ mod worker;
 extern crate lazy_static;
 extern crate serde;
 
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::Path,
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
-use eyre::Result;
-use model::parse_stream_def;
+use stable_eyre::eyre::{Context, Result};
 
-use crate::config::Config;
-use crate::config::ENVIRONMENT_HELP_STRING;
 use crate::csv::record_reader::RecordReader;
 use crate::fswatch::create_fswatch;
 use crate::metrics::STREAMS;
-use crate::reject::{configure_reject_db, create_reject_handle, create_replay_handles};
+use crate::model::parse_stream_def;
+use crate::reject::{create_reject_handle, create_replay_handles};
 use crate::stream::configure_streams;
-use crate::util::{configure_logging, create_queue, ThreadWaiter};
+use crate::util::{configure_logging, create_async_channel, create_queue, TaskHandle};
 use crate::worker::create_workers;
 use crate::{config::cli_args, model::get_stream_schema};
+use crate::{config::Config, metrics::create_metrics_endpoint};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    stable_eyre::install()?;
+    console_subscriber::init();
+    
     let args = cli_args();
     match args.subcommand() {
         Some(("schema", _)) => {
@@ -42,9 +42,9 @@ fn main() -> Result<()> {
         }
         Some(("validate", sub_args)) => {
             let path = Path::new(sub_args.value_of("PATH").unwrap());
-            match parse_stream_def(path) {
+            match parse_stream_def(path.to_owned()).await {
                 Ok(model) => {
-                    let reader = RecordReader::new(&model.input.schema)?;
+                    let reader = RecordReader::new(model.input.schema)?;
                     let avro_schema =
                         serde_json::to_string_pretty(&reader.schema(&model.output.topic))?;
                     println!("Config is valid, generated avro schema:\n{}", &avro_schema);
@@ -55,7 +55,7 @@ fn main() -> Result<()> {
             }
         }
         Some(("run", _)) => {
-            run()?;
+            run().await?;
         }
         _ => unreachable!(
             "Exhausted list of subcommands and SubcommandRequiredElseHelp prevents `None`"
@@ -64,60 +64,79 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run() -> Result<()> {
-    let config = match Config::new() {
+async fn run() -> Result<()> {
+    let config = match Config::from_env() {
         Ok(ok) => ok,
         Err(err) => {
-            println!("{}\n{}", err, *ENVIRONMENT_HELP_STRING);
+            println!("{}\n{}", err, Config::help_str());
             return Ok(());
         }
     };
 
     configure_logging(config.log_level)?;
-    log::info!(
-        "staring prometheus metrics endpoint at {}",
-        &config.metrics_port
-    );
-    prometheus_exporter::start(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        config.metrics_port,
-    ))?;
-
-    create_threads(&config)
+    create_metrics_endpoint(config.metrics_port);
+    create_tasks(&config).await
 }
 
-fn create_threads(config: &Config) -> Result<()> {
-    let mut w = ThreadWaiter::new();
+async fn create_tasks(config: &Config) -> Result<()> {
+    let mut handle = TaskHandle::new();
+
     let (tx, rx) = create_queue(config.queue_capacity);
-    let (tx_reject, rx_reject) = std::sync::mpsc::channel();
+    let (tx_reject, rx_reject) = create_async_channel(config.queue_capacity);
 
-    let (stream_reader_data, stream_writer_data) =
-        configure_streams(&config.stream_dir, &config.root_dir)?;
-    let stream_reject_data = configure_reject_db(&config.reject_db, &stream_writer_data)?;
-
+    let (stream_reader_data, stream_writer_data, stream_reject_data) = configure_streams(
+        &config
+            .stream_dir
+            .canonicalize()
+            .wrap_err("unable to resolve stream dir")?,
+        &config
+            .root_dir
+            .canonicalize()
+            .wrap_err("unable to resolve root dir")?,
+    )
+    .await?;
+    if stream_reader_data.is_empty() {
+        log::warn!("no streams found in {:?}", &config.stream_dir);
+        return Ok(());
+    }
     for i in stream_writer_data.iter() {
         STREAMS.with_label_values(&[&i.name]).set(1);
     }
 
-    create_reject_handle(&mut w, rx_reject, &config.reject_db, &stream_reject_data)?;
+    create_reject_handle(
+        rx_reject,
+        &config.reject_dir,
+        stream_reject_data,
+        &mut handle,
+    )
+    .await?;
     create_replay_handles(
-        &mut w,
         config.kafka.config(),
         config.schema_registry.config(),
-        &config.reject_db,
+        &config.reject_dir,
         &tx_reject,
         stream_writer_data.clone(),
-    )?;
+        &mut handle,
+    )
+    .await?;
+
     create_workers(
-        &mut w,
         config.kafka.config(),
         config.schema_registry.config(),
         rx,
         &tx_reject,
         stream_writer_data,
         config.workers,
+        &mut handle,
     )?;
-    let _watch = create_fswatch(&mut w, tx, stream_reader_data, Duration::from_secs(2))?;
+    let _watch = create_fswatch(
+        tx,
+        stream_reader_data,
+        Duration::from_secs(2),
+        config.queue_capacity,
+        &mut handle,
+    )
+    .await?;
 
-    w.wait_for()
+    handle.join().await
 }

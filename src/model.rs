@@ -1,10 +1,15 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use eyre::Result;
+use regex::Regex;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
+use stable_eyre::eyre::{bail, eyre, Result};
 
 use crate::csv::field_type_impl::validate_data_type;
+
+lazy_static! {
+    static ref STREAM_DEF_PATTERN: Regex = Regex::new(r"^[a-zA-Z0-9._-]+\.ya?ml$").unwrap();
+}
 
 #[derive(Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -14,6 +19,8 @@ pub struct StreamFieldModel {
     pub data_type: String,
     #[serde(default)]
     pub format: Option<String>,
+    #[serde(default)]
+    pub expr: Option<String>,
     #[serde(default = "get_optional")]
     pub optional: bool,
 }
@@ -24,9 +31,9 @@ pub struct StreamFormatModel {
     #[serde(default = "get_header")]
     pub header: bool,
     #[serde(default = "get_delimiter")]
-    pub delimiter: u8,
+    pub delimiter: char,
     #[serde(default = "get_escape")]
-    pub escape: Option<u8>,
+    pub escape: Option<char>,
     #[serde(default = "get_null_string")]
     pub null_string: String,
 }
@@ -43,6 +50,7 @@ pub struct StreamSchemaModel {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StreamInputModel {
     pub dir: String,
+    #[serde(default = "get_pattern")]
     pub pattern: String,
     pub schema: StreamSchemaModel,
 }
@@ -79,8 +87,28 @@ pub fn get_stream_schema() -> Result<String> {
     Ok(result)
 }
 
-pub fn parse_stream_def(path: &Path) -> Result<StreamModel> {
-    let result: StreamModel = serde_yaml::from_reader(std::fs::File::open(path)?)?;
+pub fn check_stream_def_path(path: &Path) -> Result<&Path> {
+    if !path.metadata()?.file_type().is_file()
+        || !STREAM_DEF_PATTERN.is_match(
+            &path
+                .file_name()
+                .ok_or_else(|| eyre!("path {:?} has no filename component", path))?
+                .to_str()
+                .ok_or_else(|| eyre!("unable to convert filename to unicode"))?,
+        )
+    {
+        bail!("invalid stream path: {:?}", path);
+    }
+    Ok(path)
+}
+
+pub async fn parse_stream_def(path: PathBuf) -> Result<StreamModel> {
+    let result = tokio::task::spawn_blocking(move || -> Result<StreamModel> {
+        let result: StreamModel =
+            serde_yaml::from_reader(std::fs::File::open(check_stream_def_path(&path)?)?)?;
+        Ok(result)
+    })
+    .await??;
     for i in result.input.schema.fields.iter() {
         validate_data_type(&i.data_type)?;
     }
@@ -91,12 +119,12 @@ fn get_header() -> bool {
     false
 }
 
-fn get_delimiter() -> u8 {
-    b';'
+fn get_delimiter() -> char {
+    ';'
 }
 
-fn get_escape() -> Option<u8> {
-    Some(b'\\')
+fn get_escape() -> Option<char> {
+    Some('\\')
 }
 
 fn get_null_string() -> String {
@@ -105,4 +133,8 @@ fn get_null_string() -> String {
 
 fn get_optional() -> bool {
     true
+}
+
+fn get_pattern() -> String {
+    ".*".to_string()
 }

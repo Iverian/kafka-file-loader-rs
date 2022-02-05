@@ -1,24 +1,33 @@
-use erased_serde::Serialize;
-use eyre::Result;
+use avro_rs::types::Value;
+use stable_eyre::eyre::Result;
 use serde_json::json;
-use serde_json::Value;
 
+use super::engine::Expression;
+use super::field_type::CsvFieldItem;
 use super::field_type::FieldType;
 use super::field_type_impl::field_type_factory;
 
 #[derive(Clone, Debug)]
 pub struct Field {
     name: String,
-    optional: bool,
     data_type: Box<dyn FieldType>,
+    optional: bool,
+    expr: Option<Expression>,
 }
 
 impl Field {
-    pub fn new(name: &str, optional: bool, data_type: &str, format: Option<&str>) -> Result<Self> {
+    pub fn new(
+        name: String,
+        optional: bool,
+        data_type: String,
+        format: Option<String>,
+        expr: Option<Expression>,
+    ) -> Result<Self> {
         Ok(Self {
-            name: name.to_owned(),
+            name,
+            data_type: field_type_factory(&data_type, format)?,
             optional,
-            data_type: field_type_factory(data_type, format)?,
+            expr,
         })
     }
 
@@ -30,14 +39,17 @@ impl Field {
         self.name.as_str()
     }
 
-    pub fn cast(&self, value: Option<&str>) -> Result<Box<dyn Serialize>> {
+    pub fn cast(&self, value: Option<String>) -> Result<CsvFieldItem> {
         match value {
-            Some(inner) => self.data_type.cast(inner),
-            _ => Ok(Box::new(None::<String>)),
+            Some(inner) => match &self.expr {
+                Some(expr) => self.data_type.cast(expr.evaluate(inner)?),
+                None => self.data_type.cast(inner),
+            },
+            _ => Ok(Value::Null),
         }
     }
 
-    pub fn schema(&self) -> Value {
+    pub fn schema(&self) -> serde_json::Value {
         let data_type = self.data_type.schema();
         json!({
             "name": self.name,
