@@ -62,7 +62,6 @@ pub struct KafkaProducerConfig {
 pub struct SchemaRegistryConfig {
     config: SrSettings,
 }
-
 pub struct Config {
     pub kafka: KafkaProducerConfig,
     pub schema_registry: SchemaRegistryConfig,

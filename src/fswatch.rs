@@ -58,9 +58,7 @@ fn create_resend_task(
     handle: &mut TaskHandle,
 ) {
     let cancel = handle.cancel_token();
-    handle.push(tokio::spawn(async move {
-        resend_task(cancel, rx_sync, tx_async).await
-    }));
+    handle.push_task(async move { resend_task(cancel, rx_sync, tx_async).await });
 }
 
 async fn resend_task(
@@ -115,9 +113,7 @@ fn create_initial_readers(
         let entry = entry.clone();
         let tx = tx.clone();
         let cancel = handle.cancel_token();
-        handle.push(tokio::spawn(async move {
-            read_existing_stream_files(cancel, tx, idx, entry).await
-        }));
+        handle.push_job(async move { read_existing_stream_files(cancel, tx, idx, entry).await });
     }
     Ok(())
 }
@@ -199,7 +195,7 @@ fn create_fswatch_loop(
 ) {
     let tx = tx.clone();
     let cancel = handle.cancel_token();
-    handle.push(tokio::spawn(async move {
+    handle.push_task(async move {
         WatchLoopImpl {
             cancel,
             tx,
@@ -208,7 +204,7 @@ fn create_fswatch_loop(
         }
         .match_loop()
         .await
-    }));
+    });
 }
 
 impl WatchLoopImpl {

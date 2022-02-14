@@ -64,9 +64,7 @@ pub async fn create_reject_handle(
 ) -> Result<()> {
     let reject_path = reject_dir.to_owned();
     let cancel = handle.cancel_token();
-    handle.push(tokio::spawn(async move {
-        reject_handle(cancel, rx, reject_path, def).await
-    }));
+    handle.push_task(async move { reject_handle(cancel, rx, reject_path, def).await });
     Ok(())
 }
 
@@ -264,9 +262,7 @@ async fn try_create_replay_handle(
     let producer = ProduceHandle::new(kafka_config, tx_reject.clone())?;
     let path = entry.path();
     let cancel = handle.cancel_token();
-    handle.push(tokio::spawn(async move {
-        replay_handle(cancel, path, def, sr_config, producer).await
-    }));
+    handle.push_job(async move { replay_handle(cancel, path, def, sr_config, producer).await });
     Ok(())
 }
 

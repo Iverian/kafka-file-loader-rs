@@ -1,5 +1,8 @@
 {
     "lldb.displayFormat": "auto",
     "lldb.showDisassembly": "never",
-    "lldb.dereferencePointers": true
+    "lldb.dereferencePointers": true,
+    "files.associations": {
+        "config": "toml"
+    }
 }

@@ -17,6 +17,7 @@ extern crate serde;
 use std::{path::Path, time::Duration};
 
 use stable_eyre::eyre::{Context, Result};
+use tracing_subscriber::{filter, prelude::*};
 
 use crate::csv::record_reader::RecordReader;
 use crate::fswatch::create_fswatch;
@@ -24,7 +25,7 @@ use crate::metrics::STREAMS;
 use crate::model::parse_stream_def;
 use crate::reject::{create_reject_handle, create_replay_handles};
 use crate::stream::configure_streams;
-use crate::util::{configure_logging, create_async_channel, create_queue, TaskHandle};
+use crate::util::{create_async_channel, create_queue, TaskHandle};
 use crate::worker::create_workers;
 use crate::{config::cli_args, model::get_stream_schema};
 use crate::{config::Config, metrics::create_metrics_endpoint};
@@ -32,8 +33,11 @@ use crate::{config::Config, metrics::create_metrics_endpoint};
 #[tokio::main]
 async fn main() -> Result<()> {
     stable_eyre::install()?;
-    console_subscriber::init();
-    
+    init_tracing()?;
+    cli_command().await
+}
+
+async fn cli_command() -> Result<()> {
     let args = cli_args();
     match args.subcommand() {
         Some(("schema", _)) => {
@@ -73,7 +77,6 @@ async fn run() -> Result<()> {
         }
     };
 
-    configure_logging(config.log_level)?;
     create_metrics_endpoint(config.metrics_port);
     create_tasks(&config).await
 }
@@ -139,4 +142,12 @@ async fn create_tasks(config: &Config) -> Result<()> {
     .await?;
 
     handle.join().await
+}
+
+fn init_tracing() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(console_subscriber::spawn())
+        .with(tracing_subscriber::fmt::layer().with_filter(filter::LevelFilter::INFO))
+        .init();
+    Ok(())
 }

@@ -1,12 +1,10 @@
+use std::future::Future;
 use std::mem;
 use std::time::Duration;
-use std::{io::stdout, path::Path, path::PathBuf};
+use std::{path::Path, path::PathBuf};
 
-use chrono::Local;
 use chrono::{DateTime, Utc};
-use fern::Dispatch;
 use futures::future;
-use log::LevelFilter;
 use rdkafka::message::OwnedHeaders;
 use schema_registry_converter::async_impl::avro::AvroEncoder;
 use schema_registry_converter::schema_registry_common::SubjectNameStrategy;
@@ -28,7 +26,7 @@ use crate::metrics::QUEUE_SIZE;
 pub type RejectItem = Box<RawStreamMessage>;
 pub type RejectSender = AsyncChannelSender<RejectItem>;
 pub type RejectReceiver = AsyncChannelReceiver<RejectItem>;
-pub type TaskJoinHandle = tokio::task::JoinHandle<Result<()>>;
+pub type TaskJoinHandle = tokio::task::JoinHandle<TaskExitStatus>;
 pub type CancelSender = tokio::sync::broadcast::Sender<()>;
 pub type CancelReceiver = tokio::sync::broadcast::Receiver<()>;
 
@@ -95,6 +93,12 @@ pub struct CancelToken {
     rx: CancelReceiver,
 }
 
+#[derive(Debug)]
+pub enum TaskExitStatus {
+    Exited,
+    Completed,
+    Err(Report),
+}
 impl CancelToken {
     pub async fn recv(&mut self) -> Result<()> {
         self.rx
@@ -119,15 +123,29 @@ impl TaskHandle {
         }
     }
 
-    pub fn push(&mut self, task: TaskJoinHandle) {
-        self.inner.push(task);
+    pub fn push_job<F: Future<Output = Result<()>> + Send + 'static>(&mut self, future: F) {
+        self.inner.push(tokio::spawn(async move {
+            match future.await {
+                Ok(_) => TaskExitStatus::Completed,
+                Err(err) => TaskExitStatus::Err(err),
+            }
+        }));
+    }
+
+    pub fn push_task<F: Future<Output = Result<()>> + Send + 'static>(&mut self, future: F) {
+        self.inner.push(tokio::spawn(async move {
+            match future.await {
+                Ok(_) => TaskExitStatus::Exited,
+                Err(err) => TaskExitStatus::Err(err),
+            }
+        }));
     }
 
     pub async fn join(mut self) -> Result<()> {
         let cancel_fut = tokio::spawn(async move {
             match tokio::signal::ctrl_c().await {
-                Ok(_) => Err(eyre!("ctrl+c")),
-                Err(err) => Err(Report::new(err)),
+                Ok(_) => TaskExitStatus::Exited,
+                Err(err) => TaskExitStatus::Err(Report::new(err)),
             }
         });
         self.inner.push(cancel_fut);
@@ -147,18 +165,31 @@ impl TaskHandle {
 
     async fn complete(
         &self,
-        select_all: (Result<Result<()>, JoinError>, usize, Vec<TaskJoinHandle>),
+        select_all: (
+            Result<TaskExitStatus, JoinError>,
+            usize,
+            Vec<TaskJoinHandle>,
+        ),
     ) -> Result<Option<Vec<TaskJoinHandle>>> {
         let (result, _, futures) = select_all;
         match result {
-            Ok(res) => {
-                if let Err(err) = res {
-                    log::warn!(": {}", err);
+            Ok(res) => match res {
+                TaskExitStatus::Completed => {
+                    log::info!("task completed");
+                }
+                TaskExitStatus::Exited => {
+                    log::info!("task exited");
                     self.tx.send(())?;
                     TaskHandle::cancel(futures).await;
                     return Ok(None);
                 }
-            }
+                TaskExitStatus::Err(err) => {
+                    log::warn!("task failed: {}", err);
+                    self.tx.send(())?;
+                    TaskHandle::cancel(futures).await;
+                    return Ok(None);
+                }
+            },
             Err(err) => {
                 log::warn!("error joining task: {}", err);
                 return Ok(Some(futures));
@@ -172,15 +203,15 @@ impl TaskHandle {
     }
 
     async fn cancel(futures: Vec<TaskJoinHandle>) {
-        log::info!("cancelling tasks");
+        log::info!("cancelling running tasks");
         for fut in futures.into_iter() {
             TaskHandle::log_task_error(fut.await);
         }
     }
 
-    fn log_task_error(task_result: Result<Result<()>, JoinError>) {
+    fn log_task_error(task_result: Result<TaskExitStatus, JoinError>) {
         if let Ok(res) = task_result {
-            if let Err(err) = res {
+            if let TaskExitStatus::Err(err) = res {
                 log::warn!("task failed: {}", err);
             }
         }
@@ -315,23 +346,6 @@ pub fn create_async_channel<T>(
 pub fn create_queue(capacity: usize) -> (QueueSender, QueueReceiver) {
     let (tx, rx) = flume::bounded(capacity);
     (QueueSender { inner: tx }, QueueReceiver { inner: rx })
-}
-
-pub fn configure_logging(log_level: LevelFilter) -> Result<()> {
-    Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{}[{}][{}] {}",
-                Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
-                record.target(),
-                record.level(),
-                message
-            ))
-        })
-        .level(log_level)
-        .chain(stdout())
-        .apply()?;
-    Ok(())
 }
 
 pub async fn encode_read_item(

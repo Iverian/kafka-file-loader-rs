@@ -16,7 +16,6 @@ use crate::util::Headers;
 use crate::util::QueueReceiver;
 use crate::util::RejectSender;
 use crate::util::TaskHandle;
-use crate::util::TaskJoinHandle;
 
 struct Worker {
     rx: QueueReceiver,
@@ -41,7 +40,7 @@ pub fn create_workers(
         let producer = ProduceHandle::new(kafka_config, tx_reject.clone())?;
         let sr_config = sr_config.clone();
         let cancel = handle.cancel_token();
-        handle.push(Worker::new(cancel, index, producer, sr_config, rx, def));
+        Worker::new(cancel, index, producer, sr_config, rx, def, handle);
     }
     Ok(())
 }
@@ -54,10 +53,11 @@ impl Worker {
         sr_config: SrSettings,
         rx: QueueReceiver,
         def: Arc<Vec<StreamWriterData>>,
-    ) -> TaskJoinHandle {
-        tokio::spawn(
-            async move { Worker::spawn(cancel, index, producer, sr_config, rx, def).await },
-        )
+        handle: &mut TaskHandle,
+    ) {
+        handle.push_task(async move {
+            Worker::spawn(cancel, index, producer, sr_config, rx, def).await
+        });
     }
 
     async fn spawn(

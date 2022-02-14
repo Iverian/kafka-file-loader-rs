@@ -11,7 +11,6 @@ serde_yaml = "0.8.23"
 prometheus-static-metric = "0.5.1"
 lazy_static = "1.4.0"
 log = "0.4.14"
-fern = "0.6.0"
 regex = "1.5.4"
 serde_json = "1.0.78"
 dyn-clone = "1.0.4"
@@ -22,6 +21,13 @@ warp = "0.3.2"
 pin-project-lite = "0.2.8"
 futures = "0.3.19"
 stable-eyre = "0.2.2"
+tracing-subscriber = "0.3.8"
+tracing = { version = "0.1.30", features = [
+    "std",
+    "attributes",
+    "log",
+    "async-await",
+] }
 tokio = { version = "1.16.1", features = [
     "rt-multi-thread",
     "fs",
