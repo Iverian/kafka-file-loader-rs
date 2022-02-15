@@ -67,13 +67,13 @@ impl RecordReader {
             let mut is_null = true;
             let value = match line.pop() {
                 Some(value) => {
-                    is_null = value != self.null_string;
+                    is_null = value == self.null_string;
                     Some(value)
                 }
                 None => None,
             };
             ensure!(
-                !field.optional() && !is_null,
+                !is_null || field.optional(),
                 format!("required field '{}' is missing", field.name())
             );
 

@@ -1,6 +1,6 @@
 use avro_rs::types::Value;
-use stable_eyre::eyre::Result;
 use serde_json::json;
+use stable_eyre::eyre::Result;
 
 use super::engine::Expression;
 use super::field_type::CsvFieldItem;
@@ -31,8 +31,8 @@ impl Field {
         })
     }
 
-    pub fn optional(&self) -> &bool {
-        &self.optional
+    pub fn optional(&self) -> bool {
+        self.optional
     }
 
     pub fn name(&self) -> &str {

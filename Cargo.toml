@@ -55,5 +55,5 @@ schema_registry_converter = { git = "https://github.com/gklijs/schema_registry_c
 schemars = { version = "0.8.8", features = ["preserve_order"] }
 flume = { version = "0.10.10", features = ["async"] }
 tokio-stream = { version = "0.1.8", features = ["io-util"] }
-rhai = { version = "1.4.1", features = ["sync", "no_module"] }
+rhai = { version = "1.4.1", features = ["sync", "no_function"] }
 console-subscriber = { version = "0.1.1", features = ["parking_lot"] }

@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use stable_eyre::eyre::eyre;
-use stable_eyre::eyre::Report;
-use stable_eyre::eyre::Result;
 use rdkafka::producer::FutureProducer;
 use rdkafka::producer::FutureRecord;
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
+use stable_eyre::eyre::eyre;
+use stable_eyre::eyre::Report;
+use stable_eyre::eyre::Result;
 
 use crate::metrics::RECORDS;
 use crate::util::Headers;
@@ -89,7 +89,7 @@ impl ProduceHandle {
 
     async fn reject(&self, err: Report, msg: RejectItem) -> Result<()> {
         log::warn!(
-            "error sending message (err = {}, raw = {})",
+            "error sending message (err = {:?}, raw = {})",
             err,
             &msg.payload.raw
         );

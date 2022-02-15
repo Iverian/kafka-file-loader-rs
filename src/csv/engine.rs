@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use rhai::packages::Package;
+use rhai::packages::StandardPackage;
 use rhai::{Engine, OptimizationLevel, Scope, AST};
 use stable_eyre::eyre::{Context, Result};
 
@@ -15,11 +17,13 @@ pub struct Expression {
 }
 
 impl Expression {
-    fn new(engine: &ExprEngine, ast: AST) -> Self {
-        Self {
+    fn new(engine: &ExprEngine, ast: AST) -> Result<Self> {
+        let result = Self {
             parent: engine.inner.clone(),
             ast,
-        }
+        };
+        result.evaluate("".to_string())?;
+        Ok(result)
     }
 
     pub fn evaluate(&self, value: String) -> Result<String> {
@@ -31,21 +35,23 @@ impl Expression {
 
 impl ExprEngine {
     pub fn new() -> Self {
-        let mut inner = Engine::new();
-        inner.set_allow_looping(false);
+        let mut inner = Engine::new_raw();
+        inner.register_global_module(StandardPackage::new().as_shared_module());
         inner.set_optimization_level(OptimizationLevel::Full);
+
         Self {
             inner: Arc::new(inner),
         }
     }
 
     pub fn compile(&self, expr: String) -> Result<Expression> {
-        Ok(Expression::new(
+        log::info!("compiling expression: {:?}", &expr);
+        Expression::new(
             &self,
             self.inner.compile_expression(&expr).wrap_err(format!(
                 "error compiling script expression from {:?}",
                 &expr
             ))?,
-        ))
+        )
     }
 }
